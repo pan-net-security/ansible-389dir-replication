@@ -1,0 +1,3 @@
+---
+ldap389_rootdn_password: "rootslave"
+ldap389_admin_password: "rootslave"

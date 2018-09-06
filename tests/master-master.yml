@@ -1,0 +1,15 @@
+---
+- hosts: ldap-master
+  become: yes
+  vars:
+    - ldap389_master_authdn: "cn=root"
+    - ldap389_master_authdn_password: "rootmaster"
+    - ldap389_replica_type: "rw"
+    - ldap389_masters: "{{ groups['ldap-master'] }}"
+    - ldap389_suffix: "dc=test,dc=com"
+    - ldap389_test: True
+    - ldap389_replication_user: "cn=mmreptest,cn=config"
+    - ldap389_replication_password: "test"
+    - ldap389_disable_ansible_log: False
+  roles:
+     - "{{ playbook_dir }}/.."

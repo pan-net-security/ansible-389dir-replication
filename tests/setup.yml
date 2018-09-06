@@ -1,0 +1,11 @@
+---
+
+- hosts: ldap-master,ldap-slave
+  become: yes
+  vars:
+    - ldap389_test: True
+    - ldap389_rootdn: "cn=root"
+    - ldap389_admin_user: "admin"
+    - ldap389_suffix: "dc=test,dc=com"
+  roles:
+    - ansible-389dir

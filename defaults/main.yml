@@ -1,0 +1,15 @@
+---
+# defaults file for ansible-389dir-replication
+#
+ldap389_changelogdir: "/var/lib/dirsrv/slapd-{{ ansible_hostname }}"
+ldap389_server_uri: "ldap://localhost/" # will be different when we implement SSL
+ldap389_disable_ansible_log: True # If you change this, console output will show your authdn password
+
+ldap389_replication_tls: false
+ldap389_replication_port: "{{ ldap389_replication_tls | ternary(636,389) }}"
+ldap389_replica_bind_method: "SIMPLE"
+ldap389_replica_transport_info: "{{ ldap389_replication_tls | ternary('SSL','LDAP') }}"
+ldap389_create_replication_user: true
+ldap389_init_from: "{{ ldap389_masters.0 }}"
+ldap389_conn_schema: "ldap{{ 's' if ldap389_replication_tls else '' }}://"
+ldap389_state: "present"

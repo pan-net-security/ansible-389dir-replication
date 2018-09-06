@@ -1,0 +1,135 @@
+---
+image: <redacted>
+
+stages:
+  - run_tests
+
+before_script:
+  - |
+    for t in `echo master slave`; do
+      for i in {1..4}; do
+        docker stop ldap-${t}0${i} || true;
+        docker rm ldap-${t}0${i} || true;
+      done;
+    done
+  - docker network rm test.pan-net.eu || true
+  - ssh-keygen -f testkey -P ""
+  - docker network create test.pan-net.eu
+  - docker pull <redacted>:4567/v131768/ubuntu-with-389-ds:18.04
+  - export dopts="--security-opt seccomp=unconfined --tmpfs /run --tmpfs /run/lock -v /sys/fs/cgroup:/sys/fs/cgroup:ro"
+  - |
+    docker run \
+           --rm \
+           --privileged \
+           -v /:/host \
+           <redacted>:4567/v131768/ubuntu-with-389-ds:18.04 \
+           setup
+  - |
+    for i in {1..4}; do
+      docker run $dopts \
+                 -h ldap-master0$i.test.pan-net.eu \
+                 --name ldap-master0$i \
+                 --network test.pan-net.eu \
+                 --detach <redacted>:4567/v131768/ubuntu-with-389-ds:18.04;
+    done
+  - |
+    for i in {1..4}; do
+      docker run $dopts \
+                 -h ldap-slave0$i.test.pan-net.eu \
+                 --name ldap-slave0$i \
+                 --network test.pan-net.eu \
+                 --detach <redacted>:4567/v131768/ubuntu-with-389-ds:18.04
+    done
+  - bash -c 'echo docker network connect test.pan-net.eu `docker ps |grep $HOSTNAME|cut -d " " -f1`'
+  - bash -c 'docker network connect test.pan-net.eu `docker ps |grep $HOSTNAME|cut -d " " -f1`'
+  - |
+    for t in `echo master slave`; do
+      for i in {1..4}; do
+        docker cp testkey.pub ldap-${t}0${i}:/home/ubuntu/.ssh/authorized_keys
+      done
+    done
+  - |
+    for i in {1..4}; do
+      IPM[$i]=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ldap-master0${i}`
+      IPS[$i]=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ldap-slave0${i}`
+    done
+  - |
+    cat << EOF > tests/inventory
+    ldap-master01.test.pan-net.eu ansible_ssh_host=${IPM[1]}
+    ldap-master02.test.pan-net.eu ansible_ssh_host=${IPM[2]}
+    ldap-master03.test.pan-net.eu ansible_ssh_host=${IPM[3]}
+    ldap-master04.test.pan-net.eu ansible_ssh_host=${IPM[4]}
+    ldap-slave01.test.pan-net.eu ansible_ssh_host=${IPS[1]}
+    ldap-slave02.test.pan-net.eu ansible_ssh_host=${IPS[2]}
+    ldap-slave03.test.pan-net.eu ansible_ssh_host=${IPS[3]}
+    ldap-slave04.test.pan-net.eu ansible_ssh_host=${IPS[4]}
+    [all]
+    ldap-master01.test.pan-net.eu
+    ldap-master02.test.pan-net.eu
+    ldap-master03.test.pan-net.eu
+    ldap-master04.test.pan-net.eu
+    [ldap-master]
+    ldap-master01.test.pan-net.eu
+    ldap-master02.test.pan-net.eu
+    ldap-master03.test.pan-net.eu
+    ldap-master04.test.pan-net.eu
+    [ldap-slave]
+    ldap-slave01.test.pan-net.eu
+    ldap-slave02.test.pan-net.eu
+    ldap-slave03.test.pan-net.eu
+    ldap-slave04.test.pan-net.eu
+    EOF
+  - |
+    for i in {1..4}; do
+    cat << EOF >> /etc/hosts
+    ${IPM[$i]} ldap-master0$i.test.pan-net.eu
+    ${IPS[$i]} ldap-slave0$i.test.pan-net.eu
+    EOF
+    done
+  - eval `ssh-agent -s`
+  - ssh-add testkey
+
+after_script:
+  - |
+    for t in `echo master slave`; do
+      for i in {1..4}; do
+        docker stop ldap-${t}0${i} || true
+      done
+    done
+  - docker network rm test.pan-net.eu
+
+run_tests:
+  stage: run_tests
+  script:
+    - cd tests
+    - cat inventory
+    # Install dependent role
+    - |
+      ansible-galaxy install \
+                     -r requirements.yml \
+                     -p roles/
+    # Install 389 itself
+    - |
+      ansible-playbook setup.yml \
+                       -i inventory \
+                       -u ubuntu
+    # Setup and test master-master replication
+    - |
+      ansible-playbook master-master.yml \
+                       -i inventory \
+                       -u ubuntu
+    # Random sleeps increase test success rate
+    - sleep 60s
+    - ./test-master-master.sh
+    # add invalid agreements which should disappear after next play
+    # - ./test-add-invalid-agreements.sh
+    # Setup and test master-slave replication
+    - |
+      ansible-playbook master-slave.yml \
+                       -i inventory \
+                       -u ubuntu        # master-slave replication setup
+    # Random sleeps increase test success rate
+    - sleep 60s
+    - ./test-master-slave.sh
+  except:
+    - master

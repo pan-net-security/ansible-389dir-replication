@@ -1,0 +1,422 @@
+---
+- name: "389dir-replication: Generate password hash for replication user"
+  shell: >
+    /usr/bin/pwdhash -- {{ ldap389_replication_password }}
+  args:
+    executable: "/bin/bash"
+  changed_when: false
+  register: pwd_hash_raw
+  when: ldap389_create_replication_user
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication:  Make a pwd hash variable"
+  set_fact:
+    pwd_hash: "{{ pwd_hash_raw.stdout }}"
+  when: ldap389_create_replication_user
+  tags: [389dir,389dir-replication]
+
+- name: "389dir-replication: Create Replication User (DN) in cn=config"
+  local_action:
+    module: ldap_entry
+    dn: "{{ ldap389_replication_user }}"
+    objectClass:
+      - inetorgperson
+      - person
+      - top
+    attributes:
+      cn: "{{ ldap389_replication_user }}"
+      sn: "{{ ldap389_replication_user }}"
+      userPassword: "{{ pwd_hash }}"
+      passwordExpirationTime: "20380119031407Z"
+      nsIdleTimeout: "0"
+    server_uri: "{{ ldap389_conn_schema }}{{ item }}"
+    bind_dn: "{{ ldap389_master_authdn if item in ldap389_masters
+                                else ldap389_slave_authdn }}"
+    bind_pw: "{{ ldap389_master_authdn_password if item in ldap389_masters
+                                         else ldap389_slave_authdn_password }}"
+    state: "present"
+  with_items: "{{ ldap389_masters if ldap389_replica_type == 'rw'
+                                  else ldap389_slaves }}"
+  when: ldap389_create_replication_user
+  delegate_to: localhost
+  run_once: true
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Configure replication changelog in cn=changelog5 cn=config"
+  local_action:
+    module: ldap_entry
+    dn: "cn=changelog5,cn=config"
+    objectClass:
+      - extensibleObject
+      - top
+    attributes:
+      nsslapd-changelogdir: "{{ldap389_changelogdir}}/changelogdb"
+      nsslapd-changelogmaxage: 10d
+    server_uri: "{{ ldap389_conn_schema }}{{ item }}"
+    bind_dn: "{{ ldap389_master_authdn }}"
+    bind_pw: "{{ ldap389_master_authdn_password }}"
+    state: "present"
+  with_items: "{{ ldap389_masters }}"
+  run_once: true
+  when:
+    - ldap389_replica_type == "rw"
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Configure {{ ldap389_replica_type }} replica in cn=mapping tree"
+  local_action:
+    module: ldap_entry
+    dn: "cn=replica,\
+         cn=\"{{ ldap389_suffix }}\",\
+         cn=mapping tree,\
+         cn=config"
+    objectClass:
+      - extensibleObject
+      - nsds5replica
+      - top
+    attributes:
+      nsds5replicaroot: "{{ ldap389_suffix }}"
+      nsds5replicaid: "{{ 65535 if ldap389_replica_type == 'ro' else \
+                          (range(1,65534) | random) }}"
+      nsds5replicatype: "{{ '3' if (ldap389_replica_type == 'rw' or \
+                                   (ldap389_replica_type == 'ro' and \
+                                   item in ldap389_masters)) \
+                                else \
+                            '2' if ldap389_replica_type == 'ro' }}"
+      nsds5ReplicaBindDN: "{{ ldap389_replication_user }}"
+      nsds5flags: "{{ '1' if (ldap389_replica_type == 'rw' or \
+                             (ldap389_replica_type == 'ro' and \
+                              item in ldap389_masters)) \
+                          else \
+                      '0' if ldap389_replica_type == 'ro' }}"
+    server_uri: "{{ ldap389_conn_schema }}{{ item }}"
+    bind_dn: "{{ ldap389_master_authdn if item in ldap389_masters else \
+                 ldap389_slave_authdn if item in ldap389_slaves else \
+                 '' }}"
+    bind_pw: "{{ ldap389_master_authdn_password if item in ldap389_masters else \
+                 ldap389_slave_authdn_password if item in ldap389_slaves else \
+                 '' }}"
+    state: "{{ ldap389_state }}"
+  run_once: true
+  register: replicas
+  with_items:
+    - "{{ ldap389_masters if ldap389_replica_type == 'rw' else [] }}"
+    - "{{ ldap389_slaves if ldap389_replica_type == 'ro' else [] }}"
+  ignore_errors: "{{ ldap389_state == 'absent' }}"
+  tags: [389dir, 389dir-replication]
+
+# FIXME: This code needs to be rewritten, in case we need to decomission
+# agreements to nonexistent hosts. But as far as ansible does not suport
+# querying LDAPs, I'm delaying this task as much as possible.
+#
+# - name: "389dir-replication: Delete agreements which might be obsolete"
+#   ldap_entry:
+#     dn: "cn={{ ldap389_replica_type }}-to-{{item}},\
+#          cn=replica,\
+#          cn=\"{{ ldap389_suffix }}\",\
+#          cn=mapping tree,\
+#          cn=config"
+#     server_uri: "{{ ldap389_server_uri }}"
+#     bind_dn: "{{ ldap389_master_authdn }}"
+#     bind_pw: "{{ ldap389_master_authdn_password }}"
+#     state: "absent"
+#   with_items:
+#     - "{{ ldap389_masters }}"
+#     - "{{ ldap389_slaves | default([]) }}"
+#   when:
+#     - (item != inventory_hostname)
+#     - (hostvars[item]['replica_created'].changed|default(False))
+#   tags: [389dir,389dir-replication]
+
+# Should be rewritten to ldap_query module in future, when Ansible supports that
+
+# - name: "389dir-replication: Get list of agreements to nonexistent hosts"
+#   shell: >
+#     ldapsearch -o ldif-wrap=no \
+#                -LLL \
+#                -H {{ ldap389_server_uri }} \
+#                -x \
+#                -D "{{ ldap389_master_authdn }}" \
+#                -w"{{ ldap389_master_authdn_password }}" \
+#                -b "cn=\"{{ ldap389_suffix }}\",cn=mapping tree,cn=config" \
+#                -s sub \
+#                -a always \
+#                -z 1000 \
+#                "(&(objectClass=nsds5ReplicationAgreement){% for h in ldap389_masters %}(!(nsDS5ReplicaHost={{ h }})){% endfor %}(cn={{ ldap389_replica_type }}*))" "dn"|grep -v ^$
+#   args:
+#     executable: "/bin/bash"
+#   register: list_of_invalid_rw_agreements
+#   failed_when: list_of_invalid_rw_agreements.rc > 1
+#   #  no_log: "{{ ldap389_disable_ansible_log }}"
+#   when: ldap389_replica_type == 'rw'
+#   tags: [389dir,389dir-replication]
+
+# - name: "389dir-replication: Get list of agreements to nonexistent hosts"
+#   shell: >
+#     ldapsearch -o ldif-wrap=no \
+#                -LLL \
+#                -H {{ ldap389_server_uri }} \
+#                -x \
+#                -D "{{ ldap389_master_authdn }}" \
+#                -w"{{ ldap389_master_authdn_password }}" \
+#                -b "cn=\"{{ ldap389_suffix }}\",cn=mapping tree,cn=config" \
+#                -s sub \
+#                -a always -z 1000 \
+#                "(&(objectClass=nsds5ReplicationAgreement){% for h in ldap389_slaves %}(!(nsDS5ReplicaHost={{ h }})){% endfor %}(cn={{ ldap389_replica_type }}*))" "dn"|grep -v ^$
+#   register: list_of_invalid_ro_agreements
+#   failed_when: list_of_invalid_ro_agreements.rc > 1
+#   #  no_log: "{{ ldap389_disable_ansible_log }}"
+#   when: ldap389_replica_type == 'ro'
+#   tags: [389dir,389dir-replication]
+
+# - name: "389dir-replication: Delete invalid agreements"
+#   ldap_entry:
+#     dn: "{{ item | replace('dn: ','') }}"
+#     server_uri: "{{ ldap389_server_uri }}"
+#     bind_dn: "{{ ldap389_master_authdn }}"
+#     bind_pw: "{{ ldap389_master_authdn_password }}"
+#     state: "absent"
+#   with_items:
+#     - "{{ list_of_invalid_rw_agreements.stdout_lines | default([]) }}"
+#     - "{{ list_of_invalid_ro_agreements.stdout_lines | default([]) }}"
+#   when: (
+#           list_of_invalid_rw_agreements.stdout_lines is defined and
+#           list_of_invalid_rw_agreements.stdout_lines | length > 0
+#         ) or
+#         (
+#           list_of_invalid_ro_agreements.stdout_lines is defined and
+#           list_of_invalid_ro_agreements.stdout_lines | length > 0
+#         )
+#   tags: [389dir,389dir-replication]
+
+# - name: "389dir-replication: Start initial replication agreement"
+#   ldap_entry:
+#     dn: "cn={{ ldap389_agreement_name | default(ldap389_replica_type) }}-to-{{item}},\
+#          cn=replica,\
+#          cn=\"{{ ldap389_suffix }}\",\
+#          cn=mapping tree,cn=config"
+#     objectClass:
+#         - nsds5replicationagreement
+#         - top
+#     attributes:
+#         nsds5replicahost: "{{ item }}"
+#         nsds5replicaport: "{{ ldap389_replication_port }}"
+#         nsds5ReplicaBindDN: "cn={{ ldap389_replication_user }},cn=config"
+#         nsds5replicabindmethod: "{{ ldap389_replica_bind_method }}"
+#         nsds5ReplicaTransportInfo: "{{ ldap389_replica_transport_info }}"
+#         nsds5replicaroot: "{{ ldap389_suffix }}"
+#         description: >
+#           {{ ldap389_replica_type }} agreement between
+#           {{inventory_hostname}} and {{item}}
+#         nsds5replicaupdateschedule: "0001-2359 0123456"
+#         nsds5replicatedattributelist: "(objectclass=*) $ EXCLUDE authorityRevocationList"
+#         nsds5replicacredentials: "{{ ldap389_replication_password }}"
+#         nsds5BeginReplicaRefresh: start
+#     server_uri: "{{ ldap389_server_uri }}"
+#     bind_dn: "{{ ldap389_master_authdn }}"
+#     bind_pw: "{{ ldap389_master_authdn_password }}"
+#     state: "present"
+#   with_items:
+#     - "{{ ldap389_masters if ldap389_replica_type == 'rw' else [] }}"
+#     - "{{ ldap389_slaves if ldap389_replica_type == 'ro' else [] }}"
+#   when:
+#     - item != inventory_hostname
+#     - hostvars[item]['replica_created']
+#     - (
+#         (
+#           groups['hosts_where_replica_was_not_created'] is defined and
+#           inventory_hostname == groups['hosts_where_replica_was_not_created'].0
+#         )
+#       or
+#         (
+#           (
+#             (ldap389_replica_type == 'ro') or
+#             (groups['hosts_where_replica_was_not_created'] is not defined)
+#           )
+#           and inventory_hostname == ldap389_masters.0
+#         )
+#       )
+#   register: initial_replica
+#   tags: [389dir,389dir-replication]
+
+- name: "389dir-replication: Create replication agreements"
+  local_action:
+    module: ldap_entry
+    dn: "cn={{ ldap389_replica_type }}-to-{{ item.1 }},\
+         cn=replica,\
+         cn=\"{{ ldap389_suffix }}\",\
+         cn=mapping tree,cn=config"
+    objectClass:
+      - nsds5replicationagreement
+      - top
+    attributes:
+      nsds5replicahost: "{{ item.1 }}"
+      nsds5replicaport: "{{ ldap389_replication_port }}"
+      nsds5ReplicaBindDN: "{{ ldap389_replication_user }}"
+      nsds5replicabindmethod: "{{ ldap389_replica_bind_method }}"
+      nsds5ReplicaTransportInfo: "{{ ldap389_replica_transport_info }}"
+      nsds5replicaroot: "{{ ldap389_suffix }}"
+      description: "Agreement between {{item.0}} and {{item.1}}"
+      nsds5replicaupdateschedule: "0001-2359 0123456"
+      nsds5replicatedattributelist: "(objectclass=*) $ EXCLUDE authorityRevocationList"
+      nsds5replicacredentials: "{{ ldap389_replication_password }}"
+    server_uri: "{{ ldap389_conn_schema }}{{ item.0 }}"
+    bind_dn: "{{ ldap389_master_authdn }}"
+    bind_pw: "{{ ldap389_master_authdn_password }}"
+    state: "present"
+  with_nested:
+    - "{{ ldap389_masters }}"
+    - "{{ ldap389_slaves if ldap389_replica_type == 'ro' else ldap389_masters }}"
+  when:
+    - item.0 != item.1
+  run_once: true
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Create list of new replicas"
+  set_fact:
+    new_replicas: "{{ replicas.results |
+                      selectattr('changed') |
+                      map(attribute='item') |
+                      list }}"
+  run_once: true
+  when:
+    - ldap389_state != 'absent'
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Refresh new replicas"
+  local_action:
+    module: ldap_attr
+    dn: "cn={{ ldap389_replica_type }}-to-{{ item.1 }},\
+         cn=replica,\
+         cn=\"{{ ldap389_suffix }}\",\
+         cn=mapping tree,cn=config"
+    name: "nsds5BeginReplicaRefresh"
+    values: "start"
+    state: "exact"
+    server_uri: "{{ ldap389_conn_schema }}{{ item.0 }}"
+    bind_dn: "{{ ldap389_master_authdn }}"
+    bind_pw: "{{ ldap389_master_authdn_password }}"
+  with_nested:
+    - "{{ ldap389_masters }}"
+    - "{{ ldap389_slaves if ldap389_replica_type == 'ro' else ldap389_masters }}"
+  run_once: true
+  when:
+    - item.0 != item.1
+    - item.0 == ldap389_init_from
+    - item.1 in new_replicas | d([])
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Create a random record"
+  local_action:
+    module: ldap_entry
+    dn: "uid=randomentry,{{ ldap389_suffix }}"
+    objectClass:
+      - inetorgperson
+      - person
+      - top
+    attributes:
+      cn: "hahaha"
+      sn: "hehehe"
+      uid: "123"
+    params:
+      server_uri: "{{ ldap389_conn_schema }}{{ ldap389_init_from }}"
+      bind_dn: "{{ ldap389_master_authdn }}"
+      bind_pw: "{{ ldap389_master_authdn_password }}"
+    state: "present"
+  run_once: true
+  when:
+    - ldap389_state != 'absent'
+  tags: [389dir, 389dir-replication, rr]
+
+- name: "389dir-replication: Wait for the random records"
+  shell: >
+    ldapsearch -H {{ ldap389_conn_schema}}{{ item }} \
+               -LLL \
+               -x \
+               -D {{ ldap389_master_authdn if ldap389_replica_type == 'rw' \
+                                           else ldap389_slave_authdn }} \
+               -w {{ ldap389_master_authdn_password if ldap389_replica_type == 'rw' \
+                                           else ldap389_slave_authdn_password }} \
+               -b {{ ldap389_suffix }} \
+               uid=randomentry | grep "uid: randomentry" | wc -l
+  with_items: "{{ ldap389_masters if ldap389_replica_type == 'rw' else \
+                  ldap389_slaves }}"
+  register: random
+  retries: 30
+  delay: 5
+  until: random.stdout == "1"
+  delegate_to: localhost
+  run_once: true
+  when:
+    - ldap389_state != 'absent'
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Delete random records"
+  local_action:
+    module: ldap_entry
+    dn: "uid=randomentry,{{ ldap389_suffix }}"
+    objectClass:
+      - inetorgperson
+      - person
+      - top
+    attributes:
+      cn: "hahaha"
+      sn: "hehehe"
+      uid: "123"
+    params:
+      server_uri: "{{ ldap389_conn_schema }}{{ ldap389_init_from }}"
+      bind_dn: "{{ ldap389_master_authdn }}"
+      bind_pw: "{{ ldap389_master_authdn_password }}"
+    state: "absent"
+  run_once: true
+  when:
+    - ldap389_state != 'absent'
+  tags: [389dir, 389dir-replication]
+
+- name: "389dir-replication: Wait for the random records to disappear"
+  shell: >
+    ldapsearch -H {{ ldap389_conn_schema}}{{ item }} \
+               -LLL \
+               -x \
+               -D {{ ldap389_master_authdn if ldap389_replica_type == 'rw' \
+                                           else ldap389_slave_authdn }} \
+               -w {{ ldap389_master_authdn_password if ldap389_replica_type == 'rw' \
+                                           else ldap389_slave_authdn_password }} \
+               -b {{ ldap389_suffix }} \
+               uid=randomentry | grep "uid: randomentry" | wc -l
+  with_items: "{{ ldap389_masters if ldap389_replica_type == 'rw' else \
+                  ldap389_slaves }}"
+  register: random
+  retries: 30
+  delay: 5
+  until: random.stdout == '0'
+  delegate_to: localhost
+  run_once: true
+  when:
+    - ldap389_state != 'absent'
+  tags: [389dir, 389dir-replication]
+
+# - name: "389dir-replication: Wait until replicas refresh"
+#   shell: >
+#     ldapsearch -o ldif-wrap=no \
+#                -LLL \
+#                -H {{ ldap389_conn_schema }}{{ item.0 }}\
+#                -x \
+#                -D "{{ ldap389_master_authdn }}" \
+#                -w{{ ldap389_master_authdn_password }} \
+#                -b "cn={{ ldap389_replica_type }}-to-{{ item.1 }},cn=replica,cn=\"{{ ldap389_suffix }}\",cn=mapping tree,cn=config" \
+#                -s base \
+#                -a always "(objectClass=*)" \
+#                nsds5BeginReplicaRefresh | grep ^nsds5BeginReplicaRefresh | wc -l
+#   register: refresh_status
+#   retries: 30
+#   delay: 5
+#   until: refresh_status.stdout == "0"
+#   no_log: "{{ ldap389_disable_ansible_log }}"
+#   delegate_to: localhost
+#   run_once: true
+#   with_nested:
+#     - "{{ ldap389_init_from }}"
+#     - "{{ ldap389_slaves if ldap389_replica_type == 'ro' else ldap389_masters }}"
+#   when:
+#     - ldap389_state != 'absent'
+#   tags: [389dir, 389dir-replication]

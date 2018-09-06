@@ -1,0 +1,21 @@
+---
+
+- hosts: ldap-master,ldap-slave
+  become: yes
+  vars:
+    - ldap389_master_authdn: "cn=root"
+    - ldap389_master_authdn_password: "rootmaster"
+    - ldap389_slave_authdn: "cn=root"
+    - ldap389_slave_authdn_password: "rootslave"
+    - ldap389_admin_user: "admin"
+    - ldap389_admin_password: "root"
+    - ldap389_replica_type: "ro"
+    - ldap389_masters: "{{ groups['ldap-master'] }}"
+    - ldap389_slaves: "{{ groups['ldap-slave'] }}"
+    - ldap389_suffix: "dc=test,dc=com"
+    - ldap389_test: true
+    - ldap389_replication_user: "cn=testslave,cn=config"
+    - ldap389_replication_password: "test"
+    - ldap389_disable_ansible_log: false
+  roles:
+    - "{{ playbook_dir }}/.."
